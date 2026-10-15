@@ -1,0 +1,14 @@
+[package]
+name = "io-budget"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "Apache-2.0"
+description = "One wall-clock budget for socket I/O, enforced below buffering layers, plus partial-frame retention that never loses a frame boundary"
+repository = "https://github.com/nekomario28/io-budget"
+keywords = ["deadline", "timeout", "tls", "framing", "io"]
+categories = ["network-programming", "asynchronous"]
+
+[dependencies]
+
+[dev-dependencies]
