@@ -14,7 +14,10 @@ use std::time::{Duration, Instant};
 
 /// The shape of a frame: a fixed-size header followed by a counted payload.
 pub trait Framed {
+    /// The decoded header, before its payload is read.
     type Header;
+    /// The complete frame: header plus payload.
+    type Frame;
 
     fn header_len() -> usize;
     fn decode_header(bytes: &[u8]) -> Result<Self::Header, io::Error>;
@@ -24,6 +27,9 @@ pub trait Framed {
     /// Returning an error here is the difference between rejecting an
     /// oversized count and allocating for it.
     fn payload_len(header: &Self::Header) -> Result<usize, io::Error>;
+
+    /// Combine a decoded header with the payload bytes read for it.
+    fn assemble(header: Self::Header, payload: Vec<u8>) -> Self::Frame;
 }
 
 /// One frame's worth of partial progress.
@@ -72,7 +78,7 @@ impl<F: Framed> FrameReader<F> {
         &mut self,
         timeout: Duration,
         mut read: impl FnMut(&mut [u8], Duration) -> Result<usize, Box<dyn std::error::Error>>,
-    ) -> Result<Option<F::Header>, Box<dyn std::error::Error>> {
+    ) -> Result<Option<F::Frame>, Box<dyn std::error::Error>> {
         let poll_deadline = Instant::now() + timeout;
         loop {
             let now = Instant::now();
@@ -91,10 +97,11 @@ impl<F: Framed> FrameReader<F> {
             }
             if self.header.is_some() && self.payload_offset == self.payload.len() {
                 let header = self.header.take().expect("header was just checked");
+                let payload = std::mem::take(&mut self.payload);
                 self.header_offset = 0;
                 self.payload_offset = 0;
                 self.frame_started = None;
-                return Ok(Some(header));
+                return Ok(Some(F::assemble(header, payload)));
             }
             let deadline = frame_deadline.map_or(poll_deadline, |frame| frame.min(poll_deadline));
             let Some(left) = deadline.checked_duration_since(now).filter(|left| !left.is_zero()) else {
@@ -157,8 +164,21 @@ mod tests {
         len: u8,
     }
 
+    #[derive(Debug, PartialEq, Eq)]
+    struct Frame {
+        header: Header,
+        payload: Vec<u8>,
+    }
+
+    impl Frame {
+        fn len(&self) -> u8 {
+            self.header.len
+        }
+    }
+
     impl Framed for Shape {
         type Header = Header;
+        type Frame = Frame;
         fn header_len() -> usize {
             5
         }
@@ -181,6 +201,9 @@ mod tests {
             }
             Ok(header.len as usize)
         }
+        fn assemble(header: Header, payload: Vec<u8>) -> Frame {
+            Frame { header, payload }
+        }
     }
 
     fn frame(len: u8) -> Vec<u8> {
@@ -196,7 +219,7 @@ mod tests {
         reader: &mut FrameReader<Shape>,
         bytes: &[u8],
         chunk: usize,
-    ) -> Result<Option<Header>, Box<dyn std::error::Error>> {
+    ) -> Result<Option<Frame>, Box<dyn std::error::Error>> {
         let mut offset = 0;
         loop {
             let mut progressed = false;
@@ -223,7 +246,8 @@ mod tests {
             let header = feed(&mut FrameReader::new(Duration::from_secs(5)), &bytes, chunk)
                 .unwrap()
                 .expect("frame was lost across polls");
-            assert_eq!(header.len, 6, "chunk size {chunk}");
+            assert_eq!(header.len(), 6, "chunk size {chunk}");
+            assert_eq!(header.payload, vec![7; 6]);
         }
     }
 
@@ -231,8 +255,8 @@ mod tests {
     fn consecutive_frames_do_not_bleed_into_each_other() {
         let bytes = [frame(2), frame(5)].concat();
         let mut reader = FrameReader::<Shape>::new(Duration::from_secs(5));
-        assert_eq!(feed(&mut reader, &bytes[..7], 2).unwrap().unwrap().len, 2);
-        assert_eq!(feed(&mut reader, &bytes[7..], 2).unwrap().unwrap().len, 5);
+        assert_eq!(feed(&mut reader, &bytes[..7], 2).unwrap().unwrap().len(), 2);
+        assert_eq!(feed(&mut reader, &bytes[7..], 2).unwrap().unwrap().len(), 5);
     }
 
     #[test]
@@ -308,6 +332,6 @@ mod tests {
                 Ok(count)
             })
             .unwrap();
-        assert_eq!(header.unwrap().len, 3);
+        assert_eq!(header.unwrap().len(), 3);
     }
 }
