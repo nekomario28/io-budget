@@ -46,4 +46,4 @@ mod frame;
 pub use budget::Budget;
 pub use clock::{Clock, ManualClock, Nanos, SystemClock};
 pub use deadline::{DeadlineStream, Timeoutable};
-pub use frame::{Framed, FrameReader};
+pub use frame::{FrameReader, Framed};

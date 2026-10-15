@@ -78,9 +78,6 @@ impl<S, C: Clock> DeadlineStream<S, C> {
     }
 }
 
-/// A socket-shaped deadline stream on the wall clock.
-pub type SocketDeadline<S> = DeadlineStream<S, SystemClock>;
-
 impl<S: Timeoutable + Read, C: Clock> Read for DeadlineStream<S, C> {
     fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
         // Before, never after. See the module docs and `delivered_bytes_survive_a_deadline_expiring_mid_read`.
@@ -172,7 +169,11 @@ mod tests {
         }
     }
 
-    fn stream(probe: Probe, millis: u64, clock: &ManualClock) -> DeadlineStream<Probe, ManualClock> {
+    fn stream(
+        probe: Probe,
+        millis: u64,
+        clock: &ManualClock,
+    ) -> DeadlineStream<Probe, ManualClock> {
         let budget = Budget::until(clock.now() + std::time::Duration::from_millis(millis));
         DeadlineStream::new(probe, budget, clock.clone())
     }
@@ -194,7 +195,9 @@ mod tests {
         let mut stream = stream(probe, 5, &clock);
 
         let mut bytes = [0u8; 4];
-        let count = stream.read(&mut bytes).expect("delivered bytes were discarded");
+        let count = stream
+            .read(&mut bytes)
+            .expect("delivered bytes were discarded");
         assert_eq!(count, 4);
         assert_eq!(&bytes, b"AMB1");
         // The budget is spent: the next operation must fail.

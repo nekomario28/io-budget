@@ -104,7 +104,10 @@ impl<F: Framed> FrameReader<F> {
                 return Ok(Some(F::assemble(header, payload)));
             }
             let deadline = frame_deadline.map_or(poll_deadline, |frame| frame.min(poll_deadline));
-            let Some(left) = deadline.checked_duration_since(now).filter(|left| !left.is_zero()) else {
+            let Some(left) = deadline
+                .checked_duration_since(now)
+                .filter(|left| !left.is_zero())
+            else {
                 return Ok(None);
             };
             let target = if self.header.is_none() {
@@ -120,8 +123,23 @@ impl<F: Framed> FrameReader<F> {
                     );
                 }
                 Ok(count) => count,
-                Err(error) if is_timeout(&error) => return Ok(None),
-                Err(error) if is_interrupted(&error) => continue,
+                Err(error)
+                    if error.downcast_ref::<io::Error>().is_some_and(|error| {
+                        matches!(
+                            error.kind(),
+                            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                        )
+                    }) =>
+                {
+                    return Ok(None);
+                }
+                Err(error)
+                    if error
+                        .downcast_ref::<io::Error>()
+                        .is_some_and(|error| error.kind() == io::ErrorKind::Interrupted) =>
+                {
+                    continue;
+                }
                 Err(error) => return Err(error),
             };
             if count > capacity {
@@ -135,19 +153,6 @@ impl<F: Framed> FrameReader<F> {
             }
         }
     }
-}
-
-/// `Box<dyn Error>` reaches `downcast_ref` through its deref.
-fn is_timeout(error: &Box<dyn std::error::Error>) -> bool {
-    error
-        .downcast_ref::<io::Error>()
-        .is_some_and(|error| matches!(error.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock))
-}
-
-fn is_interrupted(error: &Box<dyn std::error::Error>) -> bool {
-    error
-        .downcast_ref::<io::Error>()
-        .is_some_and(|error| error.kind() == io::ErrorKind::Interrupted)
 }
 
 #[cfg(test)]

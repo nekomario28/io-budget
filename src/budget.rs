@@ -61,7 +61,10 @@ mod tests {
     #[test]
     fn remaining_is_the_difference_and_never_zero() {
         let left = budget().remaining(Nanos(999_999_000)).unwrap();
-        assert_eq!(left, Duration::from_micros(1_000).max(Duration::from_millis(1)));
+        assert_eq!(
+            left,
+            Duration::from_micros(1_000).max(Duration::from_millis(1))
+        );
         // The last microsecond still reads as one millisecond, never zero.
         assert_eq!(
             budget().remaining(Nanos(999_999_999)).unwrap(),
