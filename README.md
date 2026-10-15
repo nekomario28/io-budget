@@ -85,10 +85,38 @@ No protocol. No header layout, no frame types, no pairing handshake. Those
 belong to the caller. This crate owns the timing and partial-progress rules,
 which are easy to get wrong and invisible when wrong.
 
+## Validated against the project it came from
+
+The extraction is not decorative. `mobile-webcam-bridge`'s TLS transport, its
+partial-frame reader and its deadline arithmetic now use this crate, and its
+whole regression suite passes unchanged:
+
+| Suite | Result |
+| --- | --- |
+| Core unit tests | 57 passed |
+| Real-TLS quality-switch subprocess tests | 10 passed |
+| Secure-LAN negative tests (wrong pin, wrong key, trickled handshake) | 5 passed |
+| Session integration tests | 2 passed |
+| `cargo test --no-default-features` | 40 passed |
+
+The boundary runs both ways. Mutating this crate so that every read renews a
+frame's lifetime — the classic trickle bug — fails the project's
+`trickled_frame_cannot_extend_the_partial_frame_budget_over_tls` over real TLS.
+So the project's regression still has teeth through the new seam, and this
+crate's own tests are what keep it honest.
+
+Two things the extraction surfaced, both now handled:
+
+- The crate's error text says "incomplete frame deadline expired" because it
+  has no protocol. The project translates it back to "incomplete AMB1 frame
+  deadline expired" at the boundary where it becomes a user-visible event,
+  rather than making the library guess a protocol name.
+- `Framed` needed a `Frame` type and `assemble()`: a protocol without a payload
+  is unusual, and the first version silently dropped the bytes.
+
 ## Status
 
 Extracted from [`mobile-webcam-bridge`](https://github.com/nekomario28/mobile-webcam-bridge),
-which consumes it by path. Not published to crates.io; that is a separate
-release decision.
+which consumes this crate as a dependency.
 
 MSRV 1.75. No dependencies. Apache-2.0.

@@ -77,8 +77,11 @@ impl<F: Framed> FrameReader<F> {
     pub fn poll(
         &mut self,
         timeout: Duration,
-        mut read: impl FnMut(&mut [u8], Duration) -> Result<usize, Box<dyn std::error::Error>>,
-    ) -> Result<Option<F::Frame>, Box<dyn std::error::Error>> {
+        mut read: impl FnMut(
+            &mut [u8],
+            Duration,
+        ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>>,
+    ) -> Result<Option<F::Frame>, Box<dyn std::error::Error + Send + Sync>> {
         let poll_deadline = Instant::now() + timeout;
         loop {
             let now = Instant::now();
@@ -224,7 +227,7 @@ mod tests {
         reader: &mut FrameReader<Shape>,
         bytes: &[u8],
         chunk: usize,
-    ) -> Result<Option<Frame>, Box<dyn std::error::Error>> {
+    ) -> Result<Option<Frame>, Box<dyn std::error::Error + Send + Sync>> {
         let mut offset = 0;
         loop {
             let mut progressed = false;
