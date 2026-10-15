@@ -31,25 +31,34 @@ impl std::ops::Add<std::time::Duration> for Nanos {
     }
 }
 
+impl std::ops::Sub for Nanos {
+    type Output = Self;
+    fn sub(self, earlier: Self) -> Self {
+        Self(self.0.saturating_sub(earlier.0))
+    }
+}
+
 /// A source of monotonic time, injectable so timing is testable.
 pub trait Clock {
     fn now(&self) -> Nanos;
 }
 
-/// The wall clock.
+/// The monotonic clock.
+///
+/// Anchored to the first reading rather than to the wall clock: a deadline
+/// control must not be defeated by an NTP step or a user changing the system
+/// time, and `SystemTime` can move backwards.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SystemClock;
 
+fn anchor() -> std::time::Instant {
+    static ANCHOR: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    *ANCHOR.get_or_init(std::time::Instant::now)
+}
+
 impl Clock for SystemClock {
     fn now(&self) -> Nanos {
-        Nanos(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|elapsed| elapsed.as_nanos())
-                // A pre-epoch clock is not expected; treat it as the origin
-                // rather than panicking inside an I/O path.
-                .unwrap_or_default(),
-        )
+        Nanos(anchor().elapsed().as_nanos())
     }
 }
 
@@ -90,6 +99,15 @@ mod tests {
         assert_eq!(clock.now(), Nanos(250_001_000));
         clock.set(Nanos(7));
         assert_eq!(clock.now(), Nanos(7));
+    }
+
+    #[test]
+    fn the_system_clock_only_moves_forward() {
+        let first = SystemClock.now();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let second = SystemClock.now();
+        assert!(second > first, "{first:?} then {second:?}");
+        assert!(second - first >= Nanos(5_000_000));
     }
 
     #[test]
