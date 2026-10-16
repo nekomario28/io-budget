@@ -22,6 +22,17 @@ use std::time::Duration;
 pub trait Timeoutable {
     fn set_read_timeout(&mut self, timeout: Option<Duration>) -> std::io::Result<()>;
     fn set_write_timeout(&mut self, timeout: Option<Duration>) -> std::io::Result<()>;
+
+    /// The currently installed `(read, write)` timeouts, when the transport can
+    /// report them. `DeadlineStream` snapshots this pair on construction and
+    /// restores it on [`DeadlineStream::into_inner`], so a socket handed back
+    /// does not carry a stale budget-derived timeout.
+    ///
+    /// The default `None` means "the transport cannot report them"; the
+    /// restore step is then skipped rather than guessed.
+    fn timeouts(&self) -> Option<(Option<Duration>, Option<Duration>)> {
+        None
+    }
 }
 
 impl Timeoutable for std::net::TcpStream {
@@ -33,6 +44,11 @@ impl Timeoutable for std::net::TcpStream {
     fn set_write_timeout(&mut self, timeout: Option<Duration>) -> std::io::Result<()> {
         std::net::TcpStream::set_write_timeout(self, timeout)
     }
+    fn timeouts(&self) -> Option<(Option<Duration>, Option<Duration>)> {
+        let read = std::net::TcpStream::read_timeout(self).ok()?;
+        let write = std::net::TcpStream::write_timeout(self).ok()?;
+        Some((read, write))
+    }
 }
 
 /// A stream that draws every operation from one budget.
@@ -40,14 +56,17 @@ pub struct DeadlineStream<S, C = SystemClock> {
     stream: S,
     budget: Budget,
     clock: C,
+    saved_timeouts: Option<(Option<Duration>, Option<Duration>)>,
 }
 
-impl<S, C: Clock> DeadlineStream<S, C> {
+impl<S: Timeoutable, C: Clock> DeadlineStream<S, C> {
     pub fn new(stream: S, budget: Budget, clock: C) -> Self {
+        let saved_timeouts = stream.timeouts();
         Self {
             stream,
             budget,
             clock,
+            saved_timeouts,
         }
     }
 
@@ -59,8 +78,19 @@ impl<S, C: Clock> DeadlineStream<S, C> {
         &mut self.stream
     }
 
-    pub fn into_inner(self) -> S {
-        self.stream
+    /// Give the stream back with the timeouts it had before the wrap.
+    ///
+    /// Every `read`/`write` installs the remaining budget on the socket; this
+    /// restores the pre-wrap values snapshot from [`Timeoutable::timeouts`], so
+    /// the next owner does not inherit whatever timeout the last operation
+    /// left. A transport that cannot report its timeouts is handed back
+    /// untouched.
+    pub fn into_inner(mut self) -> std::io::Result<S> {
+        if let Some((read, write)) = self.saved_timeouts {
+            self.stream.set_read_timeout(read)?;
+            self.stream.set_write_timeout(write)?;
+        }
+        Ok(self.stream)
     }
 
     /// Replace the budget without disturbing the stream. Useful when several
@@ -258,6 +288,59 @@ mod tests {
         let mut bytes = [0u8; 8];
         assert_eq!(stream.read(&mut bytes).unwrap(), 2);
         assert_eq!(stream.read(&mut bytes).unwrap(), 0);
+    }
+
+    /// The stream comes back wearing the timeouts it had before the wrap, not
+    /// whatever the last operation installed.
+    #[test]
+    fn into_inner_restores_the_pre_wrap_timeouts() {
+        struct TimedProbe {
+            probe: Probe,
+            saved: Option<(Option<Duration>, Option<Duration>)>,
+        }
+        impl Timeoutable for TimedProbe {
+            fn set_read_timeout(&mut self, t: Option<Duration>) -> std::io::Result<()> {
+                self.probe.set_read_timeout(t)
+            }
+            fn set_write_timeout(&mut self, t: Option<Duration>) -> std::io::Result<()> {
+                self.probe.set_write_timeout(t)
+            }
+            fn timeouts(&self) -> Option<(Option<Duration>, Option<Duration>)> {
+                self.saved
+            }
+        }
+        impl Read for TimedProbe {
+            fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
+                self.probe.read(b)
+            }
+        }
+        impl Write for TimedProbe {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.probe.write(b)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let clock = ManualClock::new(Nanos(0));
+        let probe = TimedProbe {
+            probe: Probe::with_payload(b"ab"),
+            saved: Some((Some(Duration::from_secs(30)), None)),
+        };
+        let budget = Budget::until(clock.now() + Duration::from_millis(100));
+        let mut stream = DeadlineStream::new(probe, budget, clock.clone());
+        let mut bytes = [0u8; 1];
+        stream.read_exact(&mut bytes).unwrap();
+
+        let probe = stream.into_inner().unwrap();
+        let reads = probe.probe.read_timeouts.borrow();
+        // install on read, restore on release
+        assert_eq!(reads.len(), 2, "{reads:?}");
+        assert_eq!(reads[1], Duration::from_secs(30));
+        let writes = probe.probe.write_timeouts.borrow();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0], Duration::MAX); // None restored
     }
 
     /// The budget can be swapped mid-transaction without disturbing the stream.
