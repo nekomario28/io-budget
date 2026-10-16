@@ -9,8 +9,9 @@
 //! that trickles a frame cannot extend its own deadline by keeping the
 //! connection alive.
 
+use crate::clock::{Clock, Nanos, SystemClock};
 use std::io;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// The shape of a frame: a fixed-size header followed by a counted payload.
 pub trait Framed {
@@ -33,21 +34,30 @@ pub trait Framed {
 }
 
 /// One frame's worth of partial progress.
-pub struct FrameReader<F: Framed> {
+pub struct FrameReader<F: Framed, C = SystemClock> {
     header_bytes: Vec<u8>,
     header_offset: usize,
     header: Option<F::Header>,
     payload: Vec<u8>,
     payload_offset: usize,
-    frame_started: Option<Instant>,
+    frame_started: Option<Nanos>,
     max_frame_age: Duration,
+    clock: C,
 }
 
-impl<F: Framed> FrameReader<F> {
+impl<F: Framed> FrameReader<F, SystemClock> {
     /// `max_frame_age` is the lifetime of one partially received frame. A frame
     /// that cannot complete inside it terminates the connection rather than
     /// trickling indefinitely.
     pub fn new(max_frame_age: Duration) -> Self {
+        Self::with_clock(max_frame_age, SystemClock)
+    }
+}
+
+impl<F: Framed, C: Clock> FrameReader<F, C> {
+    /// The same reader on an injected clock, so a test can hold time still or
+    /// skip it forward without sleeping.
+    pub fn with_clock(max_frame_age: Duration, clock: C) -> Self {
         Self {
             header_bytes: vec![0; F::header_len()],
             header_offset: 0,
@@ -56,6 +66,7 @@ impl<F: Framed> FrameReader<F> {
             payload_offset: 0,
             frame_started: None,
             max_frame_age,
+            clock,
         }
     }
 
@@ -79,9 +90,9 @@ impl<F: Framed> FrameReader<F> {
         timeout: Duration,
         mut read: impl FnMut(&mut [u8], Duration) -> io::Result<usize>,
     ) -> io::Result<Option<F::Frame>> {
-        let poll_deadline = Instant::now() + timeout;
+        let poll_deadline = self.clock.now() + timeout;
         loop {
-            let now = Instant::now();
+            let now = self.clock.now();
             let frame_deadline = self.frame_started.map(|start| start + self.max_frame_age);
             if frame_deadline.is_some_and(|deadline| now >= deadline) {
                 return Err(io::Error::new(
@@ -103,12 +114,10 @@ impl<F: Framed> FrameReader<F> {
                 return Ok(Some(F::assemble(header, payload)));
             }
             let deadline = frame_deadline.map_or(poll_deadline, |frame| frame.min(poll_deadline));
-            let Some(left) = deadline
-                .checked_duration_since(now)
-                .filter(|left| !left.is_zero())
-            else {
+            let left = deadline.saturating_sub(now).as_duration();
+            if left.is_zero() {
                 return Ok(None);
-            };
+            }
             let target = if self.header.is_none() {
                 &mut self.header_bytes[self.header_offset..]
             } else {
@@ -155,6 +164,7 @@ impl<F: Framed> FrameReader<F> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clock::ManualClock;
 
     /// A four-byte magic header plus a one-byte counted payload: enough shape
     /// to exercise every branch without being a protocol.
@@ -264,7 +274,9 @@ mod tests {
     #[test]
     fn an_expired_partial_frame_terminates_instead_of_trickling() {
         let bytes = frame(6);
-        let mut reader = FrameReader::<Shape>::new(Duration::from_millis(50));
+        let clock = ManualClock::new(Nanos::ZERO);
+        let mut reader =
+            FrameReader::<Shape, _>::with_clock(Duration::from_millis(50), clock.clone());
         // Exactly one byte, then nothing: the frame's lifetime starts there and
         // nothing after it may renew that lifetime.
         let mut first = true;
@@ -279,7 +291,7 @@ mod tests {
             })
             .unwrap();
         assert!(reader.partial());
-        std::thread::sleep(Duration::from_millis(60));
+        clock.advance(Duration::from_millis(60));
         let error = reader
             .poll(Duration::from_millis(5), |_, _| {
                 panic!("an expired partial frame must not read again")
