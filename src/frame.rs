@@ -77,11 +77,8 @@ impl<F: Framed> FrameReader<F> {
     pub fn poll(
         &mut self,
         timeout: Duration,
-        mut read: impl FnMut(
-            &mut [u8],
-            Duration,
-        ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>>,
-    ) -> Result<Option<F::Frame>, Box<dyn std::error::Error + Send + Sync>> {
+        mut read: impl FnMut(&mut [u8], Duration) -> io::Result<usize>,
+    ) -> io::Result<Option<F::Frame>> {
         let poll_deadline = Instant::now() + timeout;
         loop {
             let now = Instant::now();
@@ -90,8 +87,7 @@ impl<F: Framed> FrameReader<F> {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "incomplete frame deadline expired",
-                )
-                .into());
+                ));
             }
             if self.header_offset == F::header_len() && self.header.is_none() {
                 let header = F::decode_header(&self.header_bytes)?;
@@ -121,32 +117,30 @@ impl<F: Framed> FrameReader<F> {
             let capacity = target.len();
             let count = match read(target, left.max(Duration::from_millis(1))) {
                 Ok(0) => {
-                    return Err(
-                        io::Error::new(io::ErrorKind::UnexpectedEof, "peer disconnected").into(),
-                    );
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "peer disconnected",
+                    ));
                 }
                 Ok(count) => count,
                 Err(error)
-                    if error.downcast_ref::<io::Error>().is_some_and(|error| {
-                        matches!(
-                            error.kind(),
-                            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
-                        )
-                    }) =>
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                    ) =>
                 {
                     return Ok(None);
                 }
-                Err(error)
-                    if error
-                        .downcast_ref::<io::Error>()
-                        .is_some_and(|error| error.kind() == io::ErrorKind::Interrupted) =>
-                {
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {
                     continue;
                 }
                 Err(error) => return Err(error),
             };
             if count > capacity {
-                return Err("read returned more bytes than its buffer".into());
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "read returned more bytes than its buffer",
+                ));
             }
             self.frame_started.get_or_insert(now);
             if self.header.is_none() {
@@ -227,13 +221,13 @@ mod tests {
         reader: &mut FrameReader<Shape>,
         bytes: &[u8],
         chunk: usize,
-    ) -> Result<Option<Frame>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> io::Result<Option<Frame>> {
         let mut offset = 0;
         loop {
             let mut progressed = false;
             let result = reader.poll(Duration::from_millis(5), |target, _| {
                 if progressed {
-                    return Err(io::Error::from(io::ErrorKind::WouldBlock).into());
+                    return Err(io::Error::from(io::ErrorKind::WouldBlock));
                 }
                 let count = chunk.min(bytes.len() - offset).min(target.len());
                 target[..count].copy_from_slice(&bytes[offset..offset + count]);
@@ -277,7 +271,7 @@ mod tests {
         reader
             .poll(Duration::from_secs(5), |target, _| {
                 if !first {
-                    return Err(io::Error::from(io::ErrorKind::WouldBlock).into());
+                    return Err(io::Error::from(io::ErrorKind::WouldBlock));
                 }
                 first = false;
                 target[..1].copy_from_slice(&bytes[..1]);
@@ -316,10 +310,7 @@ mod tests {
         let error = reader
             .poll(Duration::from_millis(5), |_, _| Ok(0))
             .unwrap_err();
-        assert_eq!(
-            error.downcast_ref::<io::Error>().unwrap().kind(),
-            io::ErrorKind::UnexpectedEof
-        );
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
     }
 
     #[test]
@@ -332,7 +323,7 @@ mod tests {
             .poll(Duration::from_secs(5), |target, _| {
                 if !interrupted {
                     interrupted = true;
-                    return Err(io::Error::from(io::ErrorKind::Interrupted).into());
+                    return Err(io::Error::from(io::ErrorKind::Interrupted));
                 }
                 let count = 2.min(bytes.len() - offset).min(target.len());
                 target[..count].copy_from_slice(&bytes[offset..offset + count]);
