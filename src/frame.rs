@@ -9,8 +9,9 @@
 //! that trickles a frame cannot extend its own deadline by keeping the
 //! connection alive.
 
+use crate::clock::{Clock, Nanos, SystemClock};
 use std::io;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// The shape of a frame: a fixed-size header followed by a counted payload.
 pub trait Framed {
@@ -33,21 +34,34 @@ pub trait Framed {
 }
 
 /// One frame's worth of partial progress.
-pub struct FrameReader<F: Framed> {
+///
+/// The clock is a parameter so a test can place time exactly where it matters:
+/// a frame whose lifetime is exceeded by a *successful* read is the case that
+/// decides whether a read can renew a frame's budget, and real time cannot
+/// reproduce it reliably.
+pub struct FrameReader<F: Framed, C: Clock = SystemClock> {
     header_bytes: Vec<u8>,
     header_offset: usize,
     header: Option<F::Header>,
     payload: Vec<u8>,
     payload_offset: usize,
-    frame_started: Option<Instant>,
+    frame_started: Option<Nanos>,
     max_frame_age: Duration,
+    clock: C,
 }
 
-impl<F: Framed> FrameReader<F> {
+impl<F: Framed> FrameReader<F, SystemClock> {
     /// `max_frame_age` is the lifetime of one partially received frame. A frame
     /// that cannot complete inside it terminates the connection rather than
     /// trickling indefinitely.
     pub fn new(max_frame_age: Duration) -> Self {
+        Self::new_with_clock(max_frame_age, SystemClock)
+    }
+}
+
+impl<F: Framed, C: Clock> FrameReader<F, C> {
+    /// The same reader against an injected clock.
+    pub fn new_with_clock(max_frame_age: Duration, clock: C) -> Self {
         Self {
             header_bytes: vec![0; F::header_len()],
             header_offset: 0,
@@ -56,6 +70,7 @@ impl<F: Framed> FrameReader<F> {
             payload_offset: 0,
             frame_started: None,
             max_frame_age,
+            clock,
         }
     }
 
@@ -82,9 +97,9 @@ impl<F: Framed> FrameReader<F> {
             Duration,
         ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>>,
     ) -> Result<Option<F::Frame>, Box<dyn std::error::Error + Send + Sync>> {
-        let poll_deadline = Instant::now() + timeout;
+        let poll_deadline = self.clock.now() + timeout;
         loop {
-            let now = Instant::now();
+            let now = self.clock.now();
             let frame_deadline = self.frame_started.map(|start| start + self.max_frame_age);
             if frame_deadline.is_some_and(|deadline| now >= deadline) {
                 return Err(io::Error::new(
@@ -107,12 +122,12 @@ impl<F: Framed> FrameReader<F> {
                 return Ok(Some(F::assemble(header, payload)));
             }
             let deadline = frame_deadline.map_or(poll_deadline, |frame| frame.min(poll_deadline));
-            let Some(left) = deadline
-                .checked_duration_since(now)
-                .filter(|left| !left.is_zero())
-            else {
+            // `Nanos` has no `checked_duration_since`: a deadline that has passed
+            // leaves nothing, which is the same "the poll elapsed" answer.
+            let left = deadline.saturating_sub(now).as_duration();
+            if left.is_zero() {
                 return Ok(None);
-            };
+            }
             let target = if self.header.is_none() {
                 &mut self.header_bytes[self.header_offset..]
             } else {
@@ -161,6 +176,7 @@ impl<F: Framed> FrameReader<F> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clock::{ManualClock, Nanos};
 
     /// A four-byte magic header plus a one-byte counted payload: enough shape
     /// to exercise every branch without being a protocol.
@@ -270,7 +286,11 @@ mod tests {
     #[test]
     fn an_expired_partial_frame_terminates_instead_of_trickling() {
         let bytes = frame(6);
-        let mut reader = FrameReader::<Shape>::new(Duration::from_millis(50));
+        let clock = ManualClock::new(Nanos::ZERO);
+        let mut reader = FrameReader::<Shape, ManualClock>::new_with_clock(
+            Duration::from_millis(50),
+            clock.clone(),
+        );
         // Exactly one byte, then nothing: the frame's lifetime starts there and
         // nothing after it may renew that lifetime.
         let mut first = true;
@@ -285,13 +305,45 @@ mod tests {
             })
             .unwrap();
         assert!(reader.partial());
-        std::thread::sleep(Duration::from_millis(60));
+        clock.advance(Duration::from_millis(60));
         let error = reader
             .poll(Duration::from_millis(5), |_, _| {
                 panic!("an expired partial frame must not read again")
             })
             .unwrap_err();
         assert!(error.to_string().contains("deadline expired"), "{error}");
+    }
+
+    /// The property the injected clock exists for: a byte that arrives in time
+    /// does not extend the frame's lifetime, so a peer cannot keep one frame alive
+    /// for ever by trickling it. Two in-time bytes at 40 ms each cross the 50 ms
+    /// lifetime exactly; if a later read renewed the deadline the frame would live
+    /// on and the poll would return `Ok(None)` instead of failing.
+    #[test]
+    fn a_successful_read_does_not_renew_a_frames_lifetime() {
+        let bytes = frame(6);
+        let clock = ManualClock::new(Nanos::ZERO);
+        let mut reader = FrameReader::<Shape, ManualClock>::new_with_clock(
+            Duration::from_millis(50),
+            clock.clone(),
+        );
+        let mut delivered = 0;
+        let error = reader
+            .poll(Duration::from_secs(5), |target, _| {
+                if delivered == 2 {
+                    return Err(io::Error::from(io::ErrorKind::WouldBlock).into());
+                }
+                target[..1].copy_from_slice(&bytes[delivered..delivered + 1]);
+                delivered += 1;
+                clock.advance(Duration::from_millis(40));
+                Ok(1)
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("deadline expired"), "{error}");
+        assert_eq!(
+            2, delivered,
+            "the frame must die once its lifetime passes, after the in-time bytes"
+        );
     }
 
     /// A count that cannot be honoured must be rejected before anything is
