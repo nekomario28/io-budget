@@ -300,6 +300,38 @@ mod tests {
         assert!(error.to_string().contains("deadline expired"), "{error}");
     }
 
+    /// A byte that arrives *in time* must not extend the frame's lifetime, or a
+    /// peer can keep one frame alive for ever by trickling it. Two in-time bytes
+    /// at 40 ms each cross a 50 ms lifetime exactly: if a later read renewed the
+    /// deadline the frame would live on and this poll would return `Ok(None)`.
+    ///
+    /// This is the case the consuming project caught with a real TLS peer after
+    /// the equivalent mutation escaped this crate's own tests.
+    #[test]
+    fn a_later_read_does_not_renew_a_frames_lifetime() {
+        let bytes = frame(6);
+        let clock = ManualClock::new(Nanos::ZERO);
+        let mut reader =
+            FrameReader::<Shape, _>::with_clock(Duration::from_millis(50), clock.clone());
+        let mut delivered = 0;
+        let error = reader
+            .poll(Duration::from_secs(5), |target, _| {
+                if delivered == 2 {
+                    return Err(io::Error::from(io::ErrorKind::WouldBlock));
+                }
+                target[..1].copy_from_slice(&bytes[delivered..delivered + 1]);
+                delivered += 1;
+                clock.advance(Duration::from_millis(40));
+                Ok(1)
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("deadline expired"), "{error}");
+        assert_eq!(
+            2, delivered,
+            "the frame must die once its lifetime passes, after the in-time bytes"
+        );
+    }
+
     /// A count that cannot be honoured must be rejected before anything is
     /// allocated or read, not truncated and not honoured.
     #[test]
